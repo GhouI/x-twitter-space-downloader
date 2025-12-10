@@ -34,7 +34,7 @@
         return originalOpen.apply(this, arguments);
     };
     
-    console.log("%c✅ Interceptors installed!", "color: green; font-weight: bold");
+    console.log("%c Interceptors installed!", "color: green; font-weight: bold");
     console.log("Now REFRESH the page or seek in the Space audio.");
     console.log("URLs will appear here as they're requested.");
     console.log("");

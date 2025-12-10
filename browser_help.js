@@ -38,7 +38,7 @@
     console.log("Now REFRESH the page or seek in the Space audio.");
     console.log("URLs will appear here as they're requested.");
     console.log("");
-    console.log("%c📋 FOR COOKIES:", "color: yellow; font-weight: bold");
+    console.log("%c FOR COOKIES:", "color: yellow; font-weight: bold");
     console.log("1. Open Network tab (F12 → Network)");
     console.log("2. Filter by 'key' or 'm3u8'");
     console.log("3. Click any matching request");

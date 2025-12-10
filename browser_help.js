@@ -9,11 +9,11 @@
         const url = args[0]?.url || args[0];
         if (typeof url === 'string') {
             if (url.includes('.m3u8')) {
-                console.log("%c🎵 PLAYLIST URL:", "color: lime; font-weight: bold");
+                console.log("%c PLAYLIST URL:", "color: lime; font-weight: bold");
                 console.log(url);
             }
             if (url.includes('/key')) {
-                console.log("%c🔑 KEY URL:", "color: cyan; font-weight: bold");
+                console.log("%c KEY URL:", "color: cyan; font-weight: bold");
                 console.log(url);
             }
         }

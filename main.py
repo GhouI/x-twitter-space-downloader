@@ -5,112 +5,69 @@ import subprocess
 import requests
 import sys
 import shutil
+import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
-# Default User Agent to mimic a real browser
+# Default User Agent
 DEFAULT_UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
 
 def parse_arguments():
     parser = argparse.ArgumentParser(
-        description="Download Twitter/X Spaces (even protected ones) using a Playlist and Key.",
+        description="Multi-threaded Twitter Space Downloader.",
         formatter_class=argparse.RawTextHelpFormatter
     )
     
     parser.add_argument("playlist_url", help="The URL of the master .m3u8 playlist")
-    parser.add_argument("key_url", help="The URL of the decryption key (ends in /key?stream_name=...)")
+    parser.add_argument("key_url", help="The URL of the decryption key")
     
-    parser.add_argument("-c", "--cookie", required=True, help="The auth cookie string (Use the helper script to get this!)")
-    parser.add_argument("-o", "--output", default="twitter_space.m4a", help="Output filename (default: twitter_space.m4a)")
-    parser.add_argument("-k", "--keep", action="store_true", help="Keep temporary files (enc.key and playlist) after finishing")
+    parser.add_argument("-c", "--cookie", required=True, help="The auth cookie string")
+    parser.add_argument("-o", "--output", default="twitter_space.m4a", help="Output filename")
+    parser.add_argument("-t", "--threads", type=int, default=20, help="Number of download threads (default: 20)")
+    parser.add_argument("-k", "--keep", action="store_true", help="Keep temporary folder after finishing")
     
     return parser.parse_args()
 
-def download_file(url, filename, headers):
-    """Downloads a file from a URL and saves it locally."""
-    print(f"[INFO] Downloading {filename}...")
+def download_file_content(url, headers):
+    """Downloads file content to memory."""
     try:
-        response = requests.get(url, headers=headers)
+        response = requests.get(url, headers=headers, timeout=10)
         response.raise_for_status()
-        with open(filename, "wb") as f:
-            f.write(response.content)
-        print(f"[OK] Saved {filename}")
+        return response.content
     except requests.exceptions.RequestException as e:
-        print(f"[ERROR] Failed to download {filename}.")
-        print(f"       Server replied: {e}")
-        print("       (Check your Cookie string and ensure the Space is still available)")
-        sys.exit(1)
+        print(f"\n[ERROR] Request failed: {url}\nReason: {e}")
+        return None
 
-def fix_playlist(playlist_path, key_filename, original_playlist_url):
-    """
-    Edits the .m3u8 file to link the local key and absolute remote chunk URLs.
-    """
-    print("[INFO] Patching playlist to use local key and remote audio...")
-    
-    # Calculate base URL for audio chunks (remove filename from the end of the URL)
-    base_url = original_playlist_url.rsplit('/', 1)[0] + "/"
-    
-    with open(playlist_path, "r") as f:
-        lines = f.readlines()
-    
-    new_lines = []
-    for line in lines:
-        stripped = line.strip()
-        
-        # 1. Point Key to local file
-        if stripped.startswith("#EXT-X-KEY"):
-            # Use Regex to replace URI="..." with URI="enc.key"
-            new_line = re.sub(r'URI="[^"]+"', f'URI="{key_filename}"', line)
-            new_lines.append(new_line)
-            
-        # 2. Point Audio Chunks to remote URL (if they aren't already absolute)
-        elif stripped and not stripped.startswith("#"):
-            if not stripped.startswith("http"):
-                new_lines.append(base_url + stripped + "\n")
-            else:
-                new_lines.append(line)
-        else:
-            new_lines.append(line)
-            
-    with open(playlist_path, "w") as f:
-        f.writelines(new_lines)
+def download_chunk(url, filepath, headers, index, total):
+    """Worker function to download a single chunk."""
+    content = download_file_content(url, headers)
+    if content:
+        with open(filepath, "wb") as f:
+            f.write(content)
+        return True
+    return False
 
-def run_ffmpeg(playlist_path, output_path):
-    """Runs FFmpeg to merge the stream."""
-    print(f"[INFO] Starting FFmpeg processing -> {output_path}")
-    print("       (This may take time depending on internet speed and space duration...)")
+def print_progress(current, total, start_time):
+    """Prints a simple progress bar."""
+    percent = 100 * (current / float(total))
+    elapsed = time.time() - start_time
+    rate = current / elapsed if elapsed > 0 else 0
     
-    # Check if ffmpeg exists
-    if shutil.which("ffmpeg") is None:
-        print("[ERROR] 'ffmpeg' is not found in your PATH.")
-        print("        Please install FFmpeg to use this tool.")
-        sys.exit(1)
-
-    cmd = [
-        "ffmpeg",
-        "-y",  # Overwrite output
-        "-v", "warning", # Less verbose output
-        "-stats", # Show progress
-        "-allowed_extensions", "ALL",
-        "-protocol_whitelist", "file,http,https,tcp,tls,crypto",
-        "-i", playlist_path,
-        "-c", "copy",
-        output_path
-    ]
+    bar_length = 40
+    filled_length = int(bar_length * current // total)
+    bar = '█' * filled_length + '-' * (bar_length - filled_length)
     
-    try:
-        subprocess.run(cmd, check=True)
-        print(f"\n[SUCCESS] Download complete! File saved as: {output_path}")
-    except subprocess.CalledProcessError:
-        print("\n[ERROR] FFmpeg failed. This usually means the Key file is invalid/empty.")
-        print("        Check if your 'Cookie' was correct when downloading the key.")
+    sys.stdout.write(f'\rProgress: |{bar}| {percent:.1f}% ({current}/{total}) [{rate:.1f} chunks/s]')
+    sys.stdout.flush()
 
 def main():
     args = parse_arguments()
     
-    # Internal temp filenames
-    temp_playlist = "temp_playlist.m3u8"
-    temp_key = "enc.key"
-    
-    # Headers for requests
+    # Check FFmpeg
+    if shutil.which("ffmpeg") is None:
+        print("[ERROR] FFmpeg is not installed or not in PATH.")
+        sys.exit(1)
+
+    # Headers
     headers = {
         "User-Agent": DEFAULT_UA,
         "Cookie": args.cookie,
@@ -118,28 +75,124 @@ def main():
         "Origin": "https://x.com"
     }
 
-    # 1. Download Key
-    download_file(args.key_url, temp_key, headers)
+    # Setup Temp Directory
+    temp_dir = "temp_download_chunks"
+    if os.path.exists(temp_dir):
+        shutil.rmtree(temp_dir)
+    os.makedirs(temp_dir)
     
-    # 2. Download Playlist
-    download_file(args.playlist_url, temp_playlist, headers)
+    print("[INFO] Fetching Playlist...")
+    playlist_content = download_file_content(args.playlist_url, headers).decode('utf-8')
+    if not playlist_content:
+        sys.exit(1)
+
+    # Calculate Base URL
+    base_url = args.playlist_url.rsplit('/', 1)[0] + "/"
     
-    # 3. Fix Playlist
-    fix_playlist(temp_playlist, temp_key, args.playlist_url)
+    # Parse Playlist for Chunks and Key Metadata
+    lines = playlist_content.splitlines()
+    chunk_urls = []
+    chunk_filenames = []
+    key_line_index = -1
     
-    # 4. Process with FFmpeg
-    run_ffmpeg(temp_playlist, args.output)
+    new_playlist_lines = []
+    
+    print("[INFO] Parsing segments...")
+    for i, line in enumerate(lines):
+        line = line.strip()
+        if not line:
+            continue
+            
+        if line.startswith("#EXT-X-KEY"):
+            # Download the Key
+            print("[INFO] Downloading Decryption Key...")
+            key_content = download_file_content(args.key_url, headers)
+            if not key_content:
+                print("[ERROR] Could not download key. Check your cookies.")
+                sys.exit(1)
+            
+            # Save Key Locally
+            local_key_path = os.path.join(temp_dir, "enc.key")
+            with open(local_key_path, "wb") as f:
+                f.write(key_content)
+                
+            # Update Playlist Line to point to local key
+            # We use a regex to preserve the IV if it exists
+            new_line = re.sub(r'URI="[^"]+"', f'URI="enc.key"', line)
+            new_playlist_lines.append(new_line)
+            
+        elif line.startswith("#") and not line.startswith("#EXTINF"):
+            new_playlist_lines.append(line)
+            
+        elif line.startswith("#EXTINF"):
+            new_playlist_lines.append(line)
+            
+        else:
+            # This is a chunk URL
+            if line.startswith("http"):
+                full_url = line
+            else:
+                full_url = base_url + line
+            
+            # Generate local filename (0001.aac, 0002.aac, etc. to keep order)
+            local_filename = f"{len(chunk_urls):05d}.aac"
+            local_filepath = os.path.join(temp_dir, local_filename)
+            
+            chunk_urls.append((full_url, local_filepath))
+            chunk_filenames.append(local_filename)
+            new_playlist_lines.append(local_filename)
+
+    # Write the new local playlist
+    local_playlist_path = os.path.join(temp_dir, "local.m3u8")
+    with open(local_playlist_path, "w") as f:
+        f.write("\n".join(new_playlist_lines))
+
+    print(f"[INFO] Found {len(chunk_urls)} audio chunks.")
+    print(f"[INFO] Starting download with {args.threads} threads...")
+
+    # Multi-threaded Download
+    start_time = time.time()
+    completed = 0
+    with ThreadPoolExecutor(max_workers=args.threads) as executor:
+        futures = []
+        for index, (url, path) in enumerate(chunk_urls):
+            futures.append(executor.submit(download_chunk, url, path, headers, index, len(chunk_urls)))
+            
+        for future in as_completed(futures):
+            if future.result():
+                completed += 1
+                print_progress(completed, len(chunk_urls), start_time)
+            else:
+                print("\n[ERROR] A chunk failed to download.")
+    
+    print(f"\n[INFO] Download finished in {time.time() - start_time:.2f}s")
+
+    # FFmpeg Stitching
+    print(f"[INFO] Stitching files into {args.output}...")
+    
+    # FFmpeg command
+    cmd = [
+        "ffmpeg",
+        "-y",
+        "-allowed_extensions", "ALL",
+        "-protocol_whitelist", "file,crypto,data",
+        "-i", local_playlist_path,
+        "-c", "copy",
+        args.output,
+        "-v", "error",
+        "-stats"
+    ]
+    
+    try:
+        subprocess.run(cmd, check=True)
+        print(f"\n[SUCCESS] Saved: {args.output}")
+    except subprocess.CalledProcessError:
+        print("\n[ERROR] FFmpeg stitching failed.")
     
     # Cleanup
     if not args.keep:
-        try:
-            if os.path.exists(temp_playlist): os.remove(temp_playlist)
-            if os.path.exists(temp_key): os.remove(temp_key)
-            print("[INFO] Temporary files cleaned up.")
-        except OSError:
-            pass
-    else:
-        print(f"[INFO] kept temp files: {temp_playlist}, {temp_key}")
+        shutil.rmtree(temp_dir)
+        print("[INFO] Temp files cleaned up.")
 
 if __name__ == "__main__":
     main()
